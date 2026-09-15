@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "warp-mc-polytope"
+version = "0.1.0"
+description = "GPU Monte Carlo search for minimal-volume n-halfspace enclosing polytopes, in pure NVIDIA Warp"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alec Jacobson" }]
+keywords = ["convex-hull", "gpu", "warp", "geometry", "cuda", "monte-carlo", "polytope"]
+dependencies = [
+    "warp-lang>=1.15",
+    "numpy>=1.21",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0", "libigl", "pchs"]
+examples = ["libigl", "pchs"]
+
+[project.urls]
+Homepage = "https://github.com/alecjacobson/warp-mc-polytope"
+
+[tool.setuptools]
+packages = ["mcpolytope"]
