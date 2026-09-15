@@ -23,5 +23,8 @@ examples = ["libigl", "pchs"]
 [project.urls]
 Homepage = "https://github.com/alecjacobson/warp-mc-polytope"
 
+[project.scripts]
+mcpolytope = "mcpolytope.cli:main"
+
 [tool.setuptools]
 packages = ["mcpolytope"]

@@ -5,7 +5,8 @@ minimum-volume convex polytope with `n` faces that encloses a point set — buil
 sampling huge numbers of random `n`-direction sets and, for each, computing the volume
 of the resulting halfspace intersection **entirely on-device**.
 
-Status: work in progress. See below for what's implemented so far.
+Status: core search is implemented, tested (accuracy/robustness/GPU-CPU parity), and
+benchmarked on an NVIDIA L40. See [Results](#results) below.
 
 ## The problem
 
@@ -71,19 +72,81 @@ Validated against [`pchs`](https://github.com/alecjacobson/progressive-convex-hu
 CGAL/qhull-backed dual-hull construction across `n in {4,6,8,12,20,32}`: max relative
 error ~1e-6 on bounded random polytopes (see `tests/test_volume.py`).
 
+### Search driver: no host sync, deterministic replay, optional CUDA graph
+
+`mcpolytope/search.py`'s `Search` class runs trials in batches (default `1<<20`
+trials/batch). Each batch is seeded deterministically from `(seed, batch_index)`, so
+rather than storing every trial's directions (infeasible at billions of trials), the
+winning trial's directions are *regenerated* after the fact from its `(batch_index,
+local_index)`. Cross-batch reduction (running best volume + its global index) happens
+entirely device-side via two passes per batch:
+
+1. `atomic_min` every trial's volume into a persistent `global_best_vol` device scalar.
+2. Any trial whose volume now equals `global_best_vol` claims the global-best index via
+   `atomic_exch` (**not** `atomic_min` — a later batch's win can have a *larger* global
+   index than an earlier, now-stale one, which a monotonic `atomic_min` could never
+   adopt; this was an actual bug caught by testing, see git history).
+
+`run(..., use_graph=True)` captures one full batch step (trial kernel + both reduction
+passes + a device-side batch-index increment) into a CUDA graph and replays it,
+verified to produce bit-identical results to the ungraphed path. On the L40 at
+`batch_size >= 1<<20` we're already compute-bound (<1% difference either way) — the
+option is there for smaller-batch / launch-overhead-bound scenarios.
+
 ## Layout
 
 ```
 mcpolytope/
   support.py   # wp.func: support offsets b_i = max_j dot(dir_i, points_j)
   volume.py    # wp.func: polytope_volume_from_halfspaces (facet-clipping algorithm)
-  search.py    # search driver (in progress)
-tests/         # accuracy (vs pchs reference), robustness, GPU/CPU parity
+  search.py    # Search: batched trial + on-device reduction + optional CUDA graph
+  cli.py       # `mcpolytope mesh.ply -n 20 --trials 1e9 ...`
+tests/         # accuracy (vs pchs reference), robustness, GPU/CPU parity, perf smoke
+examples/
+  actaeon_search.py  # compares this search against PCHS's greedy simplification
+```
+
+## Usage
+
+```
+pip install -e ".[test]"
+mcpolytope path/to/mesh.ply -n 20 --trials 1e9 --use-graph --trace-csv trace.csv
+```
+
+or, to compare directly against PCHS's greedy simplification for the same `n`:
+
+```
+python examples/actaeon_search.py path/to/mesh.ply -n 8 --trials 5e8
 ```
 
 ## Running tests
 
 ```
-pip install -e ".[test]"
 pytest
 ```
+
+## Results
+
+Measured on an NVIDIA L40, mesh `Actaeon.ply` (66k faces) reduced to a 996-point convex
+hull, then PCHS-pre-simplified to 500 points before searching (matching the point set
+PCHS's own greedy simplification competes over):
+
+| n  | trials      | time   | trials/sec | MC search volume | PCHS greedy volume | MC / PCHS |
+|----|-------------|--------|------------|-------------------|---------------------|-----------|
+| 8  | 5.0e8       | 11.0s  | 45,600,000 | 1.13706           | 0.84954             | 1.34x     |
+| 20 | 2.0e9       | 224.4s | 8,912,976  | 0.88935           | 0.71450 *           | 1.24x *   |
+
+(\* PCHS greedy volume for n=20 taken from a separate simplification run, not
+re-measured in this table's session.)
+
+**Takeaway:** unstructured random-direction search, even at billions of trials, does
+not beat PCHS's greedy dual-edge-collapse simplification for either face count tested.
+The search's own trace (`--trace-csv`) shows fast early improvement that decays
+logarithmically — consistent with a `3n`-dimensional continuous optimization landscape
+where good direction sets occupy a small volume fraction that unstructured Monte Carlo
+struggles to concentrate on, while greedy edge collapse exploits local mesh structure
+directly. This is a real (if somewhat expected) negative result for "does brute force
+random search compete with a good heuristic here" — smaller `n` and/or smarter sampling
+(e.g. importance sampling around greedy solutions, simulated annealing / local search
+instead of i.i.d. resampling) are the natural next things to try if closing this gap
+mattered.
