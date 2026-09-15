@@ -49,7 +49,22 @@ def _sample_trial(
     return dx, dy, dz, b, vol
 
 
-@wp.kernel
+@wp.func
+def _compute_batch_seed(seed: int, batch_index: wp.int64):
+    """Device-side twin of `_batch_seed`, used by the graph-capture path
+    (where batch_index lives in a device array and can't be baked into the
+    graph as a Python constant). Must stay bit-for-bit identical to the
+    Python version so `regenerate()` can reproduce any trial.
+    """
+    modulus = wp.int64(2_147_483_647)
+    s64 = wp.int64(seed) * wp.int64(1_000_003) + batch_index + wp.int64(1)
+    r = s64 % modulus
+    if r < wp.int64(0):
+        r = r + modulus
+    return wp.int32(r)
+
+
+@wp.kernel(enable_backward=False)
 def _run_trials(
     seed_for_batch: int,
     points: wp.array(dtype=wp.vec3),
@@ -64,13 +79,34 @@ def _run_trials(
     volumes[tid] = vol
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
+def _run_trials_graph(
+    seed: int,
+    batch_index: wp.array(dtype=wp.int64),
+    points: wp.array(dtype=wp.vec3),
+    m: int,
+    n: int,
+    big: float,
+    volumes: wp.array(dtype=wp.float32),
+):
+    """Same as `_run_trials`, but reads the batch index from a device array
+    instead of taking seed_for_batch as a launch-time Python constant, so
+    the whole batch step can be captured once into a CUDA graph and replayed
+    with a different (device-side) batch index each time."""
+    tid = wp.tid()
+    seed_for_batch = _compute_batch_seed(seed, batch_index[0])
+    state = wp.rand_init(seed_for_batch, tid)
+    _dx, _dy, _dz, _b, vol = _sample_trial(state, points, m, n, big)
+    volumes[tid] = vol
+
+
+@wp.kernel(enable_backward=False)
 def _reduce_pass1(volumes: wp.array(dtype=wp.float32), global_best_vol: wp.array(dtype=wp.float32)):
     tid = wp.tid()
     wp.atomic_min(global_best_vol, 0, volumes[tid])
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _reduce_pass2(
     volumes: wp.array(dtype=wp.float32),
     batch_offset: wp.int64,
@@ -88,7 +124,26 @@ def _reduce_pass2(
         wp.atomic_exch(global_best_idx, 0, batch_offset + wp.int64(tid))
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
+def _reduce_pass2_graph(
+    volumes: wp.array(dtype=wp.float32),
+    batch_size: int,
+    batch_index: wp.array(dtype=wp.int64),
+    global_best_vol: wp.array(dtype=wp.float32),
+    global_best_idx: wp.array(dtype=wp.int64),
+):
+    tid = wp.tid()
+    if volumes[tid] == global_best_vol[0]:
+        batch_offset = batch_index[0] * wp.int64(batch_size)
+        wp.atomic_exch(global_best_idx, 0, batch_offset + wp.int64(tid))
+
+
+@wp.kernel(enable_backward=False)
+def _advance_batch_index(batch_index: wp.array(dtype=wp.int64)):
+    batch_index[0] = batch_index[0] + wp.int64(1)
+
+
+@wp.kernel(enable_backward=False)
 def _regenerate(
     seed_for_batch: int,
     local_idx: int,
@@ -161,18 +216,57 @@ class Search:
         self.trials_run = 0
         self.trace = []  # list of (trials_run, best_volume)
 
-    def run(self, num_trials, trace_every_batches=None):
+        self._device_batch_index = wp.array(np.array([0], dtype=np.int64), dtype=wp.int64, device=self.device)
+        self._graph = None
+        self._graph_volumes = None
+
+    def run(self, num_trials, trace_every_batches=None, use_graph=False):
         """Run `num_trials` additional Monte Carlo trials (in batches of
         `self.batch_size`). If `trace_every_batches` is set, records
         (trials_run, best_volume_so_far) that often (each checkpoint costs
         one small device->host scalar copy; no other host syncs occur).
+
+        `use_graph=True` captures the whole "one batch" step (trial kernel,
+        reduction, batch-index advance) as a single CUDA graph the first
+        time it's needed and replays it thereafter, amortizing per-launch
+        CPU overhead across `num_trials`. Only available on CUDA devices;
+        must not be mixed with `trace_every_batches` finer than the whole
+        call (trace checkpoints force a graph break to read back the host
+        scalar).
         """
         if self.trials_run % self.batch_size != 0:
             raise RuntimeError("trials_run is not batch-aligned; use a consistent batch_size")
+        if use_graph and not str(self.device).startswith("cuda"):
+            raise ValueError("use_graph=True requires a CUDA device")
 
         remaining = int(num_trials)
         batches_done = 0
-        volumes = wp.empty(self.batch_size, dtype=wp.float32, device=self.device)
+
+        if use_graph:
+            # keep the device-side batch counter in sync in case earlier
+            # (ungraphed) batches ran since it was last updated.
+            self._device_batch_index.assign(np.array([self.trials_run // self.batch_size], dtype=np.int64))
+            if self._graph_volumes is None or self._graph_volumes.shape[0] != self.batch_size:
+                self._graph_volumes = wp.empty(self.batch_size, dtype=wp.float32, device=self.device)
+            if self._graph is None:
+                with wp.ScopedCapture(device=self.device) as capture:
+                    self._one_batch_step_graph(self._graph_volumes)
+                self._graph = capture.graph
+
+            while remaining > 0:
+                B = min(self.batch_size, remaining)
+                if B != self.batch_size:
+                    # partial final batch: fall back to the ungraphed path
+                    # (graph body is sized for a full batch)
+                    break
+                wp.capture_launch(self._graph)
+                self.trials_run += B
+                remaining -= B
+                batches_done += 1
+                if trace_every_batches and batches_done % trace_every_batches == 0:
+                    self.trace.append((self.trials_run, float(self.global_best_vol.numpy()[0])))
+
+        volumes = wp.empty(self.batch_size, dtype=wp.float32, device=self.device) if remaining > 0 else None
         while remaining > 0:
             B = min(self.batch_size, remaining)
             batch_index = self.trials_run // self.batch_size
@@ -200,6 +294,23 @@ class Search:
                 self.trace.append((self.trials_run, float(self.global_best_vol.numpy()[0])))
 
         return self.best()
+
+    def _one_batch_step_graph(self, volumes):
+        B = self.batch_size
+        wp.launch(
+            _run_trials_graph,
+            dim=B,
+            inputs=[self.seed, self._device_batch_index, self.points, self.m, self.n, self.big, volumes],
+            device=self.device,
+        )
+        wp.launch(_reduce_pass1, dim=B, inputs=[volumes, self.global_best_vol], device=self.device)
+        wp.launch(
+            _reduce_pass2_graph,
+            dim=B,
+            inputs=[volumes, B, self._device_batch_index, self.global_best_vol, self.global_best_idx],
+            device=self.device,
+        )
+        wp.launch(_advance_batch_index, dim=1, inputs=[self._device_batch_index], device=self.device)
 
     def regenerate(self, gidx):
         batch_index, local_idx = divmod(int(gidx), self.batch_size)

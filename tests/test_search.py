@@ -82,6 +82,40 @@ def test_rejects_invalid_n():
         Search(pts, n=1000, device="cpu")
 
 
+def test_graph_capture_matches_ungraphed():
+    if not wp.is_device_available("cuda:0"):
+        pytest.skip("no CUDA device available")
+    rng = np.random.default_rng(6)
+    pts = _point_cloud(rng)
+
+    s1 = Search(pts, n=10, seed=42, batch_size=1024, device="cuda:0")
+    res1 = s1.run(1024 * 10)
+
+    s2 = Search(pts, n=10, seed=42, batch_size=1024, device="cuda:0")
+    res2 = s2.run(1024 * 10, use_graph=True)
+
+    assert res2.index == res1.index
+    assert res2.volume == pytest.approx(res1.volume, rel=1e-4)
+    np.testing.assert_allclose(res2.directions, res1.directions, atol=1e-5)
+
+
+def test_graph_capture_mixed_with_ungraphed_batches_stays_consistent():
+    if not wp.is_device_available("cuda:0"):
+        pytest.skip("no CUDA device available")
+    rng = np.random.default_rng(7)
+    pts = _point_cloud(rng)
+
+    s_ref = Search(pts, n=8, seed=1, batch_size=512, device="cuda:0")
+    res_ref = s_ref.run(512 * 12)
+
+    s = Search(pts, n=8, seed=1, batch_size=512, device="cuda:0")
+    s.run(512 * 4)
+    res = s.run(512 * 8, use_graph=True)
+
+    assert res.index == res_ref.index
+    assert res.volume == pytest.approx(res_ref.volume, rel=1e-4)
+
+
 def test_gpu_matches_cpu_search():
     if not wp.is_device_available("cuda:0"):
         pytest.skip("no CUDA device available")
