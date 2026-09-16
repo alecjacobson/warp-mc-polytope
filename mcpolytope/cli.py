@@ -79,6 +79,15 @@ def main(argv=None):
     parser.add_argument(
         "--avoid-duplicates", action="store_true", help="avoid resampling the same candidate direction within a trial"
     )
+    parser.add_argument(
+        "--kappa",
+        type=float,
+        default=None,
+        help="use candidates as a continuous von Mises-Fisher importance-sampling signal (concentration kappa) "
+        "instead of sampling them verbatim -- 0 ignores the weighting (uniform sphere), higher values "
+        "concentrate more tightly around each candidate. Requires --candidates original-hull; "
+        "incompatible with --avoid-duplicates.",
+    )
     args = parser.parse_args(argv)
 
     wp.init()
@@ -105,6 +114,7 @@ def main(argv=None):
         candidates=candidates,
         weights=weights,
         avoid_duplicates=args.avoid_duplicates,
+        kappa=args.kappa,
     )
 
     trace_every = args.trace_every_batches

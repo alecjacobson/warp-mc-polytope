@@ -31,6 +31,19 @@ def main():
     parser.add_argument("--simplify-to", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--kappa-schemes",
+        nargs="*",
+        default=["area", "solid_angle"],
+        help="weight schemes to run the kappa (continuous vMF importance sampling) sweep for",
+    )
+    parser.add_argument(
+        "--kappas",
+        nargs="*",
+        type=float,
+        default=[0.0, 5.0, 20.0, 50.0, 200.0, 1000.0],
+        help="von Mises-Fisher concentrations to sweep (in addition to exact discrete sampling)",
+    )
     args = parser.parse_args()
 
     wp.init()
@@ -49,7 +62,7 @@ def main():
 
     normals, areas = hull_face_candidates(hV, hF)
 
-    def run(candidates, weights, avoid_duplicates, seed):
+    def run(candidates, weights, avoid_duplicates, seed, kappa=None):
         s = Search(
             pV,
             n=args.n,
@@ -57,6 +70,7 @@ def main():
             candidates=candidates,
             weights=weights,
             avoid_duplicates=avoid_duplicates,
+            kappa=kappa,
             device=args.device,
         )
         t0 = time.perf_counter()
@@ -75,11 +89,22 @@ def main():
     dt = time.perf_counter() - t0
     print(f"{'random-sphere':<14} {'n/a':<10} {res.volume:>12.5f} {res.volume / pchs_vol:>8.4f} {s.trials_run / dt:>12,.0f}")
 
+    weight_cache = {}
     for name, weight_fn in WEIGHT_FUNCS.items():
         weights = weight_fn(hV, hF, normals, areas)
+        weight_cache[name] = weights
         for avoid_duplicates in (False, True):
             vol, rate = run(normals, weights, avoid_duplicates, args.seed)
             print(f"{name:<14} {str(avoid_duplicates):<10} {vol:>12.5f} {vol / pchs_vol:>8.4f} {rate:>12,.0f}")
+
+    if args.kappa_schemes:
+        print()
+        print(f"{'scheme':<14} {'kappa':<10} {'volume':>12} {'/PCHS':>8} {'trials/sec':>12}")
+        for name in args.kappa_schemes:
+            weights = weight_cache[name]
+            for kappa in args.kappas:
+                vol, rate = run(normals, weights, False, args.seed, kappa=kappa)
+                print(f"{name:<14} {kappa:<10g} {vol:>12.5f} {vol / pchs_vol:>8.4f} {rate:>12,.0f}")
 
 
 if __name__ == "__main__":

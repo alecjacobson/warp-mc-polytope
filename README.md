@@ -127,6 +127,21 @@ directions nothing in the mesh actually points toward.
   sampling could never trigger (near-zero probability of exact/near-duplicate
   directions there) — only surfaced once a finite candidate pool made duplicates common.
 
+### Continuous importance sampling instead of subset selection
+
+Discrete candidate sampling can *only* ever pick one of the mesh's existing `K` face
+normals — never a direction "between" two real faces (e.g. a bevel) that might support a
+tighter polytope. `Search(..., candidates=, weights=, kappa=)` instead uses the
+weighted candidate distribution purely as an **importance-sampling signal**: each draw
+picks a seed candidate via the alias method, then samples the *actual* trial direction
+from a continuous [von Mises-Fisher](https://en.wikipedia.org/wiki/Von_Mises%E2%80%93Fisher_distribution)
+kernel (`mcpolytope/candidates.py::sample_vmf`) centered on that seed with concentration
+`kappa` — `kappa=0` ignores the weighting entirely (uniform sphere), `kappa -> inf`
+recovers exact discrete sampling, intermediate `kappa` gives a tunable "fuzziness" that
+lets a trial land on and score directions no input face has. The S² case has an exact,
+closed-form, rejection-free sampler (unlike the general Wood-1994 algorithm needed for
+higher dimensions — see the module docstring), so this is as cheap as the discrete path.
+
 ## Layout
 
 ```
@@ -151,10 +166,19 @@ mcpolytope path/to/mesh.ply -n 20 --trials 1e9 --use-graph --trace-csv trace.csv
 ```
 
 restricting to the mesh's original hull face normals, area-weighted, without
-duplicates within a trial (see [Results](#results) for why this combination matters):
+duplicates within a trial (see [Results](#results) for why this combination matters --
+it's the best-performing configuration found so far):
 
 ```
 mcpolytope path/to/mesh.ply -n 20 --trials 1e8 --candidates original-hull --weight-by area --avoid-duplicates
+```
+
+or as a continuous importance-sampling signal instead of exact discrete reuse (see
+[Results](#results) for why, on the meshes tested, this is *not* currently an
+improvement over the discrete version above):
+
+```
+mcpolytope path/to/mesh.ply -n 20 --trials 1e8 --candidates original-hull --weight-by area --kappa 1000
 ```
 
 or, to compare directly against PCHS's greedy simplification for the same `n`:
@@ -237,3 +261,47 @@ available option, not the default. Smaller `n` and/or smarter sampling (e.g. imp
 sampling seeded from a greedy solution, simulated annealing / local search instead of
 i.i.d. resampling) remain the natural next things to try if closing the remaining gap
 at larger `n` mattered.
+
+### Continuous importance sampling (kappa) vs. subset selection
+
+The obvious question: can allowing directions the mesh doesn't actually have — via
+continuous vMF jitter around the weighted candidates instead of exact reuse — beat
+discrete subset selection? Swept `kappa` for the `area` and `solid_angle` schemes at
+both `n=20` (1e8 trials/kappa) and `n=8` (5e7 trials/kappa):
+
+`n=20`, `area` scheme (discrete exact, `avoid_duplicates=True`: `0.71499`, `1.0007x`):
+
+| kappa | volume  | / PCHS |
+|------:|---------|--------|
+| 50    | 0.82421 | 1.154x |
+| 200   | 0.78873 | 1.104x |
+| 1000  | 0.75994 | 1.064x |
+| 5000  | 0.74325 | 1.040x |
+
+`n=8`, `area` scheme (discrete exact, `avoid_duplicates=True`: `0.83249`, `0.980x`):
+
+| kappa | volume  | / PCHS |
+|------:|---------|--------|
+| 0     | 1.02801 | 1.210x |
+| 50    | 0.98561 | 1.160x |
+| 200   | 0.91079 | 1.072x |
+| 1000  | 0.88656 | 1.044x |
+| 5000  | 0.86223 | 1.015x |
+
+**Takeaway (continuous importance sampling): no — at every kappa tried, at matched
+trial budgets, continuous vMF jitter around the weighted candidates converges *toward*
+the discrete result but never reaches or beats it**, at either `n`. The trend is
+monotonic and smooth in `kappa` (validating the sampler: `kappa->inf` really does
+recover the discrete answer, as designed), it just never crosses over even at `kappa`
+high enough that samples are typically within ~1 degree of their seed face. The likely
+reason: `Actaeon.ply` is a real physical mesh with genuinely flat faces, so its actual
+face normals already *are* the best local supporting directions for a tight
+enclosure — a small random perturbation off a real (already near-optimal) face normal
+is a strictly worse direction far more often than a better one, so continuous jitter
+mostly just adds noise. Reaching a genuinely novel direction (e.g. a bevel exactly
+between two adjacent real faces) would need either much higher trial budgets than
+tested here, or a smarter proposal than a single-seed symmetric vMF kernel (e.g. a
+kernel centered on edges/bevels between adjacent weighted faces rather than face
+centers) — a reasonable next thing to try, but out of scope for this round: for this
+mesh, at these budgets, **subset selection (discrete candidate sampling) remains the
+better strategy**.
