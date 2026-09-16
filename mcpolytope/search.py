@@ -1,7 +1,7 @@
 import numpy as np
 import warp as wp
 
-from mcpolytope.candidates import alias_table, sample_alias
+from mcpolytope.candidates import alias_table, sample_alias, sample_vmf
 from mcpolytope.support import support_offset
 from mcpolytope.volume import N_MAX, fvecN, polytope_volume_from_halfspaces
 
@@ -128,6 +128,45 @@ def _sample_trial_candidates(
 
 
 @wp.func
+def _sample_trial_vmf(
+    state: wp.uint32,
+    candidates: wp.array(dtype=wp.vec3),
+    prob: wp.array(dtype=wp.float32),
+    alias: wp.array(dtype=wp.int32),
+    K: int,
+    kappa: float,
+    points: wp.array(dtype=wp.vec3),
+    m: int,
+    n: int,
+    big: float,
+):
+    """Like `_sample_trial_candidates`, but instead of using the alias-
+    picked candidate direction verbatim, treats it as the center of a von
+    Mises-Fisher kernel (concentration `kappa`) and draws the actual trial
+    direction from that continuous distribution -- so the search can land
+    on directions no input face has, while still being guided by the
+    weighted candidate signal (kappa=0 ignores it entirely: uniform sphere).
+    """
+    dx = fvecN()
+    dy = fvecN()
+    dz = fvecN()
+    b = fvecN()
+
+    for k in range(n):
+        state, idx = sample_alias(state, prob, alias, K)
+        mu = candidates[idx]
+        state, d = sample_vmf(state, mu, kappa)
+        dx[k] = d[0]
+        dy[k] = d[1]
+        dz[k] = d[2]
+
+    for k in range(n):
+        b[k] = support_offset(dx[k], dy[k], dz[k], points, m)
+    vol = polytope_volume_from_halfspaces(dx, dy, dz, b, n, big)
+    return dx, dy, dz, b, vol
+
+
+@wp.func
 def _compute_batch_seed(seed: int, batch_index: wp.int64):
     """Device-side twin of `_batch_seed`, used by the graph-capture path
     (where batch_index lives in a device array and can't be baked into the
@@ -225,6 +264,48 @@ def _run_trials_candidates_graph(
 
 
 @wp.kernel(enable_backward=False)
+def _run_trials_vmf(
+    seed_for_batch: int,
+    candidates: wp.array(dtype=wp.vec3),
+    prob: wp.array(dtype=wp.float32),
+    alias: wp.array(dtype=wp.int32),
+    K: int,
+    kappa: float,
+    points: wp.array(dtype=wp.vec3),
+    m: int,
+    n: int,
+    big: float,
+    volumes: wp.array(dtype=wp.float32),
+):
+    tid = wp.tid()
+    state = wp.rand_init(seed_for_batch, tid)
+    _dx, _dy, _dz, _b, vol = _sample_trial_vmf(state, candidates, prob, alias, K, kappa, points, m, n, big)
+    volumes[tid] = vol
+
+
+@wp.kernel(enable_backward=False)
+def _run_trials_vmf_graph(
+    seed: int,
+    batch_index: wp.array(dtype=wp.int64),
+    candidates: wp.array(dtype=wp.vec3),
+    prob: wp.array(dtype=wp.float32),
+    alias: wp.array(dtype=wp.int32),
+    K: int,
+    kappa: float,
+    points: wp.array(dtype=wp.vec3),
+    m: int,
+    n: int,
+    big: float,
+    volumes: wp.array(dtype=wp.float32),
+):
+    tid = wp.tid()
+    seed_for_batch = _compute_batch_seed(seed, batch_index[0])
+    state = wp.rand_init(seed_for_batch, tid)
+    _dx, _dy, _dz, _b, vol = _sample_trial_vmf(state, candidates, prob, alias, K, kappa, points, m, n, big)
+    volumes[tid] = vol
+
+
+@wp.kernel(enable_backward=False)
 def _reduce_pass1(volumes: wp.array(dtype=wp.float32), global_best_vol: wp.array(dtype=wp.float32)):
     tid = wp.tid()
     wp.atomic_min(global_best_vol, 0, volumes[tid])
@@ -314,6 +395,31 @@ def _regenerate_candidates(
     vol_out[0] = vol
 
 
+@wp.kernel(enable_backward=False)
+def _regenerate_vmf(
+    seed_for_batch: int,
+    local_idx: int,
+    candidates: wp.array(dtype=wp.vec3),
+    prob: wp.array(dtype=wp.float32),
+    alias: wp.array(dtype=wp.int32),
+    K: int,
+    kappa: float,
+    points: wp.array(dtype=wp.vec3),
+    m: int,
+    n: int,
+    big: float,
+    dirs_out: wp.array(dtype=wp.vec3),
+    b_out: wp.array(dtype=wp.float32),
+    vol_out: wp.array(dtype=wp.float32),
+):
+    state = wp.rand_init(seed_for_batch, local_idx)
+    dx, dy, dz, b, vol = _sample_trial_vmf(state, candidates, prob, alias, K, kappa, points, m, n, big)
+    for k in range(n):
+        dirs_out[k] = wp.vec3(dx[k], dy[k], dz[k])
+        b_out[k] = b[k]
+    vol_out[0] = vol
+
+
 class SearchResult:
     def __init__(self, volume, index, seed, directions, offsets, trace):
         self.volume = volume
@@ -351,6 +457,7 @@ class Search:
         candidates=None,
         weights=None,
         avoid_duplicates=False,
+        kappa=None,
     ):
         if n < 4 or n > N_MAX:
             raise ValueError(f"n must be in [4, {N_MAX}], got {n}")
@@ -394,6 +501,18 @@ class Search:
         elif weights is not None:
             raise ValueError("weights requires candidates to be given")
 
+        self.kappa = None
+        if kappa is not None:
+            if self.candidates is None:
+                raise ValueError("kappa requires candidates to be given")
+            if self.avoid_duplicates:
+                raise ValueError(
+                    "avoid_duplicates is not supported with kappa (continuous vMF draws "
+                    "have zero probability of exact duplicates; a without-replacement "
+                    "scheme isn't built for this mode)"
+                )
+            self.kappa = float(kappa)
+
         self.global_best_vol = wp.array(np.array([np.inf], dtype=np.float32), dtype=wp.float32, device=self.device)
         self.global_best_idx = wp.array(np.array([_NO_INDEX], dtype=np.int64), dtype=wp.int64, device=self.device)
 
@@ -434,7 +553,9 @@ class Search:
                 self._graph_volumes = wp.empty(self.batch_size, dtype=wp.float32, device=self.device)
             if self._graph is None:
                 with wp.ScopedCapture(device=self.device) as capture:
-                    if self.candidates is not None:
+                    if self.kappa is not None:
+                        self._one_batch_step_graph_vmf(self._graph_volumes)
+                    elif self.candidates is not None:
                         self._one_batch_step_graph_candidates(self._graph_volumes)
                     else:
                         self._one_batch_step_graph(self._graph_volumes)
@@ -459,7 +580,26 @@ class Search:
             batch_index = self.trials_run // self.batch_size
             seed_for_batch = _batch_seed(self.seed, batch_index)
 
-            if self.candidates is not None:
+            if self.kappa is not None:
+                wp.launch(
+                    _run_trials_vmf,
+                    dim=B,
+                    inputs=[
+                        seed_for_batch,
+                        self.candidates,
+                        self.prob,
+                        self.alias,
+                        self.K,
+                        self.kappa,
+                        self.points,
+                        self.m,
+                        self.n,
+                        self.big,
+                        volumes,
+                    ],
+                    device=self.device,
+                )
+            elif self.candidates is not None:
                 wp.launch(
                     _run_trials_candidates,
                     dim=B,
@@ -549,13 +689,65 @@ class Search:
         )
         wp.launch(_advance_batch_index, dim=1, inputs=[self._device_batch_index], device=self.device)
 
+    def _one_batch_step_graph_vmf(self, volumes):
+        B = self.batch_size
+        wp.launch(
+            _run_trials_vmf_graph,
+            dim=B,
+            inputs=[
+                self.seed,
+                self._device_batch_index,
+                self.candidates,
+                self.prob,
+                self.alias,
+                self.K,
+                self.kappa,
+                self.points,
+                self.m,
+                self.n,
+                self.big,
+                volumes,
+            ],
+            device=self.device,
+        )
+        wp.launch(_reduce_pass1, dim=B, inputs=[volumes, self.global_best_vol], device=self.device)
+        wp.launch(
+            _reduce_pass2_graph,
+            dim=B,
+            inputs=[volumes, B, self._device_batch_index, self.global_best_vol, self.global_best_idx],
+            device=self.device,
+        )
+        wp.launch(_advance_batch_index, dim=1, inputs=[self._device_batch_index], device=self.device)
+
     def regenerate(self, gidx):
         batch_index, local_idx = divmod(int(gidx), self.batch_size)
         seed_for_batch = _batch_seed(self.seed, batch_index)
         dirs_out = wp.zeros(self.n, dtype=wp.vec3, device=self.device)
         b_out = wp.zeros(self.n, dtype=wp.float32, device=self.device)
         vol_out = wp.zeros(1, dtype=wp.float32, device=self.device)
-        if self.candidates is not None:
+        if self.kappa is not None:
+            wp.launch(
+                _regenerate_vmf,
+                dim=1,
+                inputs=[
+                    seed_for_batch,
+                    local_idx,
+                    self.candidates,
+                    self.prob,
+                    self.alias,
+                    self.K,
+                    self.kappa,
+                    self.points,
+                    self.m,
+                    self.n,
+                    self.big,
+                    dirs_out,
+                    b_out,
+                    vol_out,
+                ],
+                device=self.device,
+            )
+        elif self.candidates is not None:
             wp.launch(
                 _regenerate_candidates,
                 dim=1,

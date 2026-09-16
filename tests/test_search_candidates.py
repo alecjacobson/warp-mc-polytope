@@ -119,3 +119,114 @@ def test_graph_capture_matches_ungraphed_candidates():
 
     assert res2.index == res1.index
     assert res2.volume == pytest.approx(res1.volume, rel=1e-4)
+
+
+# --- kappa (mixture-of-vMF continuous importance sampling) mode ---
+
+
+def test_kappa_valid_enclosure():
+    rng = np.random.default_rng(8)
+    pts = _point_cloud(rng)
+    cands = _candidate_dirs(rng, 50)
+    weights = rng.random(50) + 0.1
+
+    s = Search(pts, n=8, seed=8, batch_size=512, candidates=cands, weights=weights, kappa=50.0, device="cpu")
+    res = s.run(2048)
+
+    violation = res.directions @ pts.T - res.offsets[:, None]
+    assert violation.max() < 1e-3
+
+
+def test_kappa_directions_need_not_match_any_candidate():
+    # with a small kappa (loose concentration) the actual trial directions
+    # should typically NOT land exactly on an input candidate direction --
+    # this is the whole point of importance sampling vs subset selection.
+    rng = np.random.default_rng(9)
+    pts = _point_cloud(rng)
+    cands = _candidate_dirs(rng, 30)
+
+    s = Search(pts, n=8, seed=9, batch_size=512, candidates=cands, kappa=5.0, device="cpu")
+    s.run(2048)
+
+    dirs, _offs, _vol = s.regenerate(37)
+    dists = np.linalg.norm(cands[None, :, :] - dirs[:, None, :], axis=2)
+    assert dists.min(axis=1).max() > 1e-3  # not an exact match to any candidate
+
+
+def test_kappa_zero_matches_uniform_sphere_search():
+    # kappa=0 should ignore the weighting entirely (uniform-sphere vMF
+    # kernel), so it should behave statistically like the plain random mode
+    # -- not bit-identical (different kernel/RNG-consumption path), but a
+    # comparably-sized batch should reach a similar volume ballpark.
+    rng = np.random.default_rng(10)
+    pts = _point_cloud(rng)
+    cands = _candidate_dirs(rng, 50)
+
+    s_vmf = Search(pts, n=8, seed=10, batch_size=4096, candidates=cands, kappa=0.0, device="cpu")
+    res_vmf = s_vmf.run(4096 * 8)
+
+    s_random = Search(pts, n=8, seed=10, batch_size=4096, device="cpu")
+    res_random = s_random.run(4096 * 8)
+
+    assert np.isfinite(res_vmf.volume) and np.isfinite(res_random.volume)
+    assert res_vmf.volume == pytest.approx(res_random.volume, rel=0.5)
+
+
+def test_kappa_requires_candidates():
+    rng = np.random.default_rng(11)
+    pts = _point_cloud(rng)
+    with pytest.raises(ValueError):
+        Search(pts, n=6, kappa=10.0, device="cpu")
+
+
+def test_kappa_rejects_avoid_duplicates():
+    rng = np.random.default_rng(12)
+    pts = _point_cloud(rng)
+    cands = _candidate_dirs(rng, 30)
+    with pytest.raises(ValueError):
+        Search(pts, n=6, candidates=cands, kappa=10.0, avoid_duplicates=True, device="cpu")
+
+
+def test_kappa_regenerate_matches_recorded_best():
+    rng = np.random.default_rng(13)
+    pts = _point_cloud(rng)
+    cands = _candidate_dirs(rng, 50)
+    weights = rng.random(50) + 0.1
+    s = Search(pts, n=10, seed=13, batch_size=1024, candidates=cands, weights=weights, kappa=30.0, device="cpu")
+    res = s.run(4096)
+    _dirs, _offs, vol = s.regenerate(res.index)
+    assert vol == pytest.approx(float(s.global_best_vol.numpy()[0]), rel=1e-5)
+
+
+def test_kappa_gpu_matches_cpu():
+    if not wp.is_device_available("cuda:0"):
+        pytest.skip("no CUDA device available")
+    rng = np.random.default_rng(14)
+    pts = _point_cloud(rng)
+    cands = _candidate_dirs(rng, 60)
+    weights = rng.random(60) + 0.1
+
+    s_cpu = Search(pts, n=8, seed=14, batch_size=1024, candidates=cands, weights=weights, kappa=40.0, device="cpu")
+    res_cpu = s_cpu.run(4096)
+    s_gpu = Search(pts, n=8, seed=14, batch_size=1024, candidates=cands, weights=weights, kappa=40.0, device="cuda:0")
+    res_gpu = s_gpu.run(4096)
+
+    assert res_gpu.index == res_cpu.index
+    assert res_gpu.volume == pytest.approx(res_cpu.volume, rel=1e-4)
+    np.testing.assert_allclose(res_gpu.directions, res_cpu.directions, atol=1e-4)
+
+
+def test_kappa_graph_capture_matches_ungraphed():
+    if not wp.is_device_available("cuda:0"):
+        pytest.skip("no CUDA device available")
+    rng = np.random.default_rng(15)
+    pts = _point_cloud(rng)
+    cands = _candidate_dirs(rng, 40)
+
+    s1 = Search(pts, n=8, seed=15, batch_size=1024, candidates=cands, kappa=20.0, device="cuda:0")
+    res1 = s1.run(1024 * 8)
+    s2 = Search(pts, n=8, seed=15, batch_size=1024, candidates=cands, kappa=20.0, device="cuda:0")
+    res2 = s2.run(1024 * 8, use_graph=True)
+
+    assert res2.index == res1.index
+    assert res2.volume == pytest.approx(res1.volume, rel=1e-4)
