@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import warp as wp
 
-from mcpolytope.candidates import alias_table, sample_alias
+from mcpolytope.candidates import alias_table, sample_alias, sample_vmf
 
 wp.init()
 
@@ -112,6 +112,68 @@ def test_successive_draws_within_one_thread_are_not_all_identical():
     # every thread's n draws must not all collapse to a single repeated value
     for row in draws:
         assert len(set(row.tolist())) > 1, f"all draws identical: {row}"
+
+
+@wp.kernel(enable_backward=False)
+def _vmf_kernel(seed: int, mu: wp.vec3, kappa: float, out: wp.array(dtype=wp.vec3)):
+    tid = wp.tid()
+    state = wp.rand_init(seed, tid)
+    _state, d = sample_vmf(state, mu, kappa)
+    out[tid] = d
+
+
+def draw_vmf(mu, kappa, num_draws, seed=0, device="cpu"):
+    out = wp.zeros(num_draws, dtype=wp.vec3, device=device)
+    wp.launch(_vmf_kernel, dim=num_draws, inputs=[seed, wp.vec3(*mu), kappa, out], device=device)
+    return out.numpy()
+
+
+def _mean_resultant_length_theory(kappa):
+    # A(kappa) = coth(kappa) - 1/kappa, the S^2 vMF mean resultant length
+    return 1.0 / np.tanh(kappa) - 1.0 / kappa
+
+
+@pytest.mark.parametrize("kappa", [1.0, 10.0, 100.0, 1000.0])
+def test_vmf_mean_resultant_length_matches_theory(kappa):
+    mu = np.array([0.0, 0.0, 1.0])
+    d = draw_vmf(mu, kappa, 300_000)
+    rbar = np.linalg.norm(d.mean(axis=0))
+    assert rbar == pytest.approx(_mean_resultant_length_theory(kappa), abs=0.01)
+
+
+def test_vmf_kappa_zero_is_uniform_over_sphere():
+    mu = np.array([0.0, 0.0, 1.0])
+    d = draw_vmf(mu, 0.0, 300_000)
+    # mean should be ~0 (isotropic) and per-axis variance ~1/3
+    assert np.linalg.norm(d.mean(axis=0)) < 0.01
+    np.testing.assert_allclose(d.var(axis=0), np.full(3, 1.0 / 3.0), atol=0.01)
+
+
+def test_vmf_large_kappa_concentrates_tightly():
+    mu = np.array([0.3, -0.5, 0.81])
+    mu = mu / np.linalg.norm(mu)
+    d = draw_vmf(mu, 1.0e5, 50_000)
+    dots = d @ mu
+    assert dots.min() > 0.99  # within ~8 degrees of mu for every single draw
+
+
+def test_vmf_samples_are_unit_length():
+    mu = np.array([1.0, 0.0, 0.0])
+    for kappa in [0.0, 5.0, 500.0]:
+        d = draw_vmf(mu, kappa, 5000)
+        np.testing.assert_allclose(np.linalg.norm(d, axis=1), 1.0, atol=1e-5)
+
+
+def test_vmf_gpu_matches_cpu():
+    if not wp.is_device_available("cuda:0"):
+        pytest.skip("no CUDA device available")
+    mu = np.array([0.2, 0.6, -0.77])
+    mu = mu / np.linalg.norm(mu)
+    d_cpu = draw_vmf(mu, 50.0, 200_000, seed=3, device="cpu")
+    d_gpu = draw_vmf(mu, 50.0, 200_000, seed=3, device="cuda:0")
+    rbar_cpu = np.linalg.norm(d_cpu.mean(axis=0))
+    rbar_gpu = np.linalg.norm(d_gpu.mean(axis=0))
+    assert rbar_gpu == pytest.approx(rbar_cpu, abs=0.01)
 
 
 def test_gpu_matches_cpu_distribution():

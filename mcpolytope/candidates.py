@@ -68,3 +68,38 @@ def sample_alias(state: wp.uint32, prob: wp.array(dtype=wp.float32), alias: wp.a
     if coin < prob[i]:
         return state, i
     return state, alias[i]
+
+
+@wp.func
+def sample_vmf(state: wp.uint32, mu: wp.vec3, kappa: float):
+    """Draw a unit vector from the von Mises-Fisher distribution on S^2
+    centered at unit vector `mu` with concentration `kappa` (kappa=0 is
+    uniform over the sphere; kappa -> inf concentrates onto `mu`).
+
+    Exact, rejection-free, closed-form inversion (valid specifically for
+    S^2 -- the general Wood-1994 algorithm for S^(p-1), p>3, needs
+    acceptance/rejection, but the p=3 marginal density of w=cos(angle) is
+    exactly proportional to exp(kappa*w) with no extra sin^(p-2) factor, so
+    its CDF inverts directly). Returns (new_state, direction); see
+    `sample_alias`'s docstring for why the state must be threaded through
+    explicitly rather than mutated in place.
+    """
+    u = wp.randf(state)
+    if kappa <= 0.0:
+        w = 2.0 * u - 1.0
+    else:
+        w = 1.0 + (1.0 / kappa) * wp.log(u + (1.0 - u) * wp.exp(-2.0 * kappa))
+    w = wp.clamp(w, -1.0, 1.0)
+
+    phi = 6.283185307179586 * wp.randf(state)
+
+    if wp.abs(mu[0]) < 0.9:
+        t = wp.vec3(1.0, 0.0, 0.0)
+    else:
+        t = wp.vec3(0.0, 1.0, 0.0)
+    e1 = wp.normalize(wp.cross(mu, t))
+    e2 = wp.cross(mu, e1)
+
+    r = wp.sqrt(wp.max(0.0, 1.0 - w * w))
+    d = w * mu + r * (wp.cos(phi) * e1 + wp.sin(phi) * e2)
+    return state, wp.normalize(d)
