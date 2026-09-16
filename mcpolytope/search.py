@@ -1,8 +1,12 @@
 import numpy as np
 import warp as wp
 
+from mcpolytope.candidates import alias_table, sample_alias
 from mcpolytope.support import support_offset
 from mcpolytope.volume import N_MAX, fvecN, polytope_volume_from_halfspaces
+
+ivecN = wp.types.vector(length=N_MAX, dtype=wp.int32)
+_MAX_DEDUP_RETRIES = 8
 
 
 # atomic_min only ever decreases the stored value, so the "not found yet"
@@ -43,6 +47,80 @@ def _sample_trial(
         dx[k] = x / length
         dy[k] = y / length
         dz[k] = z / length
+    for k in range(n):
+        b[k] = support_offset(dx[k], dy[k], dz[k], points, m)
+    vol = polytope_volume_from_halfspaces(dx, dy, dz, b, n, big)
+    return dx, dy, dz, b, vol
+
+
+@wp.func
+def _sample_trial_candidates(
+    state: wp.uint32,
+    candidates: wp.array(dtype=wp.vec3),
+    prob: wp.array(dtype=wp.float32),
+    alias: wp.array(dtype=wp.int32),
+    K: int,
+    avoid_duplicates: int,
+    points: wp.array(dtype=wp.vec3),
+    m: int,
+    n: int,
+    big: float,
+):
+    """Like `_sample_trial`, but draws each of the n directions from a
+    finite weighted candidate pool (via the alias method) instead of the
+    continuous sphere. If avoid_duplicates != 0, retries a bounded number of
+    times on an in-trial collision, then falls back to a deterministic
+    linear scan for the first still-unused candidate index (guaranteed to
+    terminate since Search requires n <= K when avoid_duplicates is set).
+    """
+    dx = fvecN()
+    dy = fvecN()
+    dz = fvecN()
+    b = fvecN()
+    chosen = ivecN()
+
+    for k in range(n):
+        state, idx = sample_alias(state, prob, alias, K)
+
+        if avoid_duplicates != 0:
+            is_dup = bool(False)
+            for j in range(k):
+                if chosen[j] == idx:
+                    is_dup = True
+
+            # bounded number of resample attempts (no while loops: Warp
+            # doesn't like scalar redefinition inside dynamic while loops)
+            for _attempt in range(_MAX_DEDUP_RETRIES):
+                if is_dup:
+                    state, idx = sample_alias(state, prob, alias, K)
+                    is_dup = bool(False)
+                    for j in range(k):
+                        if chosen[j] == idx:
+                            is_dup = True
+
+            if is_dup:
+                # deterministic fallback: first still-unused candidate index.
+                # Terminates because Search enforces n <= K whenever
+                # avoid_duplicates is set, so a free index always exists.
+                found = bool(False)
+                fallback_idx = int(0)
+                for cand in range(K):
+                    if not found:
+                        is_taken = bool(False)
+                        for j in range(k):
+                            if chosen[j] == cand:
+                                is_taken = True
+                        if not is_taken:
+                            fallback_idx = cand
+                            found = True
+                idx = fallback_idx
+
+        chosen[k] = idx
+        c = candidates[idx]
+        dx[k] = c[0]
+        dy[k] = c[1]
+        dz[k] = c[2]
+
     for k in range(n):
         b[k] = support_offset(dx[k], dy[k], dz[k], points, m)
     vol = polytope_volume_from_halfspaces(dx, dy, dz, b, n, big)
@@ -97,6 +175,52 @@ def _run_trials_graph(
     seed_for_batch = _compute_batch_seed(seed, batch_index[0])
     state = wp.rand_init(seed_for_batch, tid)
     _dx, _dy, _dz, _b, vol = _sample_trial(state, points, m, n, big)
+    volumes[tid] = vol
+
+
+@wp.kernel(enable_backward=False)
+def _run_trials_candidates(
+    seed_for_batch: int,
+    candidates: wp.array(dtype=wp.vec3),
+    prob: wp.array(dtype=wp.float32),
+    alias: wp.array(dtype=wp.int32),
+    K: int,
+    avoid_duplicates: int,
+    points: wp.array(dtype=wp.vec3),
+    m: int,
+    n: int,
+    big: float,
+    volumes: wp.array(dtype=wp.float32),
+):
+    tid = wp.tid()
+    state = wp.rand_init(seed_for_batch, tid)
+    _dx, _dy, _dz, _b, vol = _sample_trial_candidates(
+        state, candidates, prob, alias, K, avoid_duplicates, points, m, n, big
+    )
+    volumes[tid] = vol
+
+
+@wp.kernel(enable_backward=False)
+def _run_trials_candidates_graph(
+    seed: int,
+    batch_index: wp.array(dtype=wp.int64),
+    candidates: wp.array(dtype=wp.vec3),
+    prob: wp.array(dtype=wp.float32),
+    alias: wp.array(dtype=wp.int32),
+    K: int,
+    avoid_duplicates: int,
+    points: wp.array(dtype=wp.vec3),
+    m: int,
+    n: int,
+    big: float,
+    volumes: wp.array(dtype=wp.float32),
+):
+    tid = wp.tid()
+    seed_for_batch = _compute_batch_seed(seed, batch_index[0])
+    state = wp.rand_init(seed_for_batch, tid)
+    _dx, _dy, _dz, _b, vol = _sample_trial_candidates(
+        state, candidates, prob, alias, K, avoid_duplicates, points, m, n, big
+    )
     volumes[tid] = vol
 
 
@@ -163,6 +287,33 @@ def _regenerate(
     vol_out[0] = vol
 
 
+@wp.kernel(enable_backward=False)
+def _regenerate_candidates(
+    seed_for_batch: int,
+    local_idx: int,
+    candidates: wp.array(dtype=wp.vec3),
+    prob: wp.array(dtype=wp.float32),
+    alias: wp.array(dtype=wp.int32),
+    K: int,
+    avoid_duplicates: int,
+    points: wp.array(dtype=wp.vec3),
+    m: int,
+    n: int,
+    big: float,
+    dirs_out: wp.array(dtype=wp.vec3),
+    b_out: wp.array(dtype=wp.float32),
+    vol_out: wp.array(dtype=wp.float32),
+):
+    state = wp.rand_init(seed_for_batch, local_idx)
+    dx, dy, dz, b, vol = _sample_trial_candidates(
+        state, candidates, prob, alias, K, avoid_duplicates, points, m, n, big
+    )
+    for k in range(n):
+        dirs_out[k] = wp.vec3(dx[k], dy[k], dz[k])
+        b_out[k] = b[k]
+    vol_out[0] = vol
+
+
 class SearchResult:
     def __init__(self, volume, index, seed, directions, offsets, trace):
         self.volume = volume
@@ -189,7 +340,18 @@ class Search:
     (`regenerate`/`best`) instead of storing every trial's directions.
     """
 
-    def __init__(self, points, n, seed=0, big_factor=64.0, batch_size=1 << 20, device=None):
+    def __init__(
+        self,
+        points,
+        n,
+        seed=0,
+        big_factor=64.0,
+        batch_size=1 << 20,
+        device=None,
+        candidates=None,
+        weights=None,
+        avoid_duplicates=False,
+    ):
         if n < 4 or n > N_MAX:
             raise ValueError(f"n must be in [4, {N_MAX}], got {n}")
         points = np.asarray(points, dtype=np.float64)
@@ -209,6 +371,28 @@ class Search:
         self.device = device if device is not None else wp.get_preferred_device()
         self.m = recentered.shape[0]
         self.points = wp.array(recentered.astype(np.float32), dtype=wp.vec3, device=self.device)
+
+        self.candidates = None
+        self.avoid_duplicates = bool(avoid_duplicates)
+        if candidates is not None:
+            candidates = np.asarray(candidates, dtype=np.float64)
+            if candidates.ndim != 2 or candidates.shape[1] != 3:
+                raise ValueError("candidates must have shape (K, 3)")
+            K = candidates.shape[0]
+            if K == 0:
+                raise ValueError("candidates must be non-empty")
+            if self.avoid_duplicates and n > K:
+                raise ValueError(f"avoid_duplicates=True requires n <= K (n={n}, K={K})")
+            unit_candidates = candidates / np.linalg.norm(candidates, axis=1, keepdims=True)
+
+            self.K = K
+            self.candidates = wp.array(unit_candidates.astype(np.float32), dtype=wp.vec3, device=self.device)
+            weights = np.ones(K) if weights is None else np.asarray(weights, dtype=np.float64)
+            prob_np, alias_np = alias_table(weights)
+            self.prob = wp.array(prob_np, dtype=wp.float32, device=self.device)
+            self.alias = wp.array(alias_np, dtype=wp.int32, device=self.device)
+        elif weights is not None:
+            raise ValueError("weights requires candidates to be given")
 
         self.global_best_vol = wp.array(np.array([np.inf], dtype=np.float32), dtype=wp.float32, device=self.device)
         self.global_best_idx = wp.array(np.array([_NO_INDEX], dtype=np.int64), dtype=wp.int64, device=self.device)
@@ -250,7 +434,10 @@ class Search:
                 self._graph_volumes = wp.empty(self.batch_size, dtype=wp.float32, device=self.device)
             if self._graph is None:
                 with wp.ScopedCapture(device=self.device) as capture:
-                    self._one_batch_step_graph(self._graph_volumes)
+                    if self.candidates is not None:
+                        self._one_batch_step_graph_candidates(self._graph_volumes)
+                    else:
+                        self._one_batch_step_graph(self._graph_volumes)
                 self._graph = capture.graph
 
             while remaining > 0:
@@ -272,12 +459,32 @@ class Search:
             batch_index = self.trials_run // self.batch_size
             seed_for_batch = _batch_seed(self.seed, batch_index)
 
-            wp.launch(
-                _run_trials,
-                dim=B,
-                inputs=[seed_for_batch, self.points, self.m, self.n, self.big, volumes],
-                device=self.device,
-            )
+            if self.candidates is not None:
+                wp.launch(
+                    _run_trials_candidates,
+                    dim=B,
+                    inputs=[
+                        seed_for_batch,
+                        self.candidates,
+                        self.prob,
+                        self.alias,
+                        self.K,
+                        int(self.avoid_duplicates),
+                        self.points,
+                        self.m,
+                        self.n,
+                        self.big,
+                        volumes,
+                    ],
+                    device=self.device,
+                )
+            else:
+                wp.launch(
+                    _run_trials,
+                    dim=B,
+                    inputs=[seed_for_batch, self.points, self.m, self.n, self.big, volumes],
+                    device=self.device,
+                )
             wp.launch(_reduce_pass1, dim=B, inputs=[volumes, self.global_best_vol], device=self.device)
             wp.launch(
                 _reduce_pass2,
@@ -312,18 +519,71 @@ class Search:
         )
         wp.launch(_advance_batch_index, dim=1, inputs=[self._device_batch_index], device=self.device)
 
+    def _one_batch_step_graph_candidates(self, volumes):
+        B = self.batch_size
+        wp.launch(
+            _run_trials_candidates_graph,
+            dim=B,
+            inputs=[
+                self.seed,
+                self._device_batch_index,
+                self.candidates,
+                self.prob,
+                self.alias,
+                self.K,
+                int(self.avoid_duplicates),
+                self.points,
+                self.m,
+                self.n,
+                self.big,
+                volumes,
+            ],
+            device=self.device,
+        )
+        wp.launch(_reduce_pass1, dim=B, inputs=[volumes, self.global_best_vol], device=self.device)
+        wp.launch(
+            _reduce_pass2_graph,
+            dim=B,
+            inputs=[volumes, B, self._device_batch_index, self.global_best_vol, self.global_best_idx],
+            device=self.device,
+        )
+        wp.launch(_advance_batch_index, dim=1, inputs=[self._device_batch_index], device=self.device)
+
     def regenerate(self, gidx):
         batch_index, local_idx = divmod(int(gidx), self.batch_size)
         seed_for_batch = _batch_seed(self.seed, batch_index)
         dirs_out = wp.zeros(self.n, dtype=wp.vec3, device=self.device)
         b_out = wp.zeros(self.n, dtype=wp.float32, device=self.device)
         vol_out = wp.zeros(1, dtype=wp.float32, device=self.device)
-        wp.launch(
-            _regenerate,
-            dim=1,
-            inputs=[seed_for_batch, local_idx, self.points, self.m, self.n, self.big, dirs_out, b_out, vol_out],
-            device=self.device,
-        )
+        if self.candidates is not None:
+            wp.launch(
+                _regenerate_candidates,
+                dim=1,
+                inputs=[
+                    seed_for_batch,
+                    local_idx,
+                    self.candidates,
+                    self.prob,
+                    self.alias,
+                    self.K,
+                    int(self.avoid_duplicates),
+                    self.points,
+                    self.m,
+                    self.n,
+                    self.big,
+                    dirs_out,
+                    b_out,
+                    vol_out,
+                ],
+                device=self.device,
+            )
+        else:
+            wp.launch(
+                _regenerate,
+                dim=1,
+                inputs=[seed_for_batch, local_idx, self.points, self.m, self.n, self.big, dirs_out, b_out, vol_out],
+                device=self.device,
+            )
         return dirs_out.numpy(), b_out.numpy(), float(vol_out.numpy()[0])
 
     def best(self):

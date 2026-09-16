@@ -132,7 +132,17 @@ def polytope_volume_from_halfspaces(dx: fvecN, dy: fvecN, dz: fvecN, b: fvecN, n
                     rhs = b[j] - bi * dotij
                     norm_a = wp.sqrt(a_u * a_u + a_v * a_v)
                     if norm_a < deg_tol:
-                        if rhs < 0.0:
+                        # A (near-)duplicate/parallel constraint's rhs is
+                        # mathematically 0 here; float32 rounding of dot(ni,nj)
+                        # for near-identical directions can push it slightly
+                        # negative by noise alone (e.g. dot(d,d) rounding to
+                        # 1.0000001 instead of 1.0). Without a tolerance that
+                        # noise wrongly empties the whole facet (observed: all
+                        # directions equal -> every facet's rhs ~ -1e-7 ->
+                        # count=0 -> volume silently collapses to 0 instead of
+                        # the mathematically-correct +inf for this degenerate,
+                        # effectively-unbounded configuration).
+                        if rhs < -deg_tol:
                             count = 0
                     else:
                         px, py, count = _clip_halfplane(px, py, count, a_u, a_v, rhs)

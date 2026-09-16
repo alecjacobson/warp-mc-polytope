@@ -52,11 +52,19 @@ def alias_table(weights):
 
 @wp.func
 def sample_alias(state: wp.uint32, prob: wp.array(dtype=wp.float32), alias: wp.array(dtype=wp.int32), K: int):
+    """Returns (new_state, index). A wp.uint32 RNG state passed into a
+    wp.func is NOT mutated-in-place from the caller's perspective (that only
+    happens for consecutive builtin calls within the *same* function body) --
+    callers MUST reassign their local `state` from the returned value, or
+    every call in a loop will silently draw the exact same index. (This was
+    a real bug: see git history -- with replacement-sampled candidate
+    directions were previously identical across an entire trial.)
+    """
     u = wp.randf(state)
     i = wp.int32(u * float(K))
     if i >= K:
         i = K - 1
     coin = wp.randf(state)
     if coin < prob[i]:
-        return i
-    return alias[i]
+        return state, i
+    return state, alias[i]
