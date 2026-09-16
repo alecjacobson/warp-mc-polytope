@@ -7,17 +7,21 @@ import numpy as np
 import warp as wp
 
 
-def _load_points(mesh_path, simplify_to):
-    """Read a mesh, take its convex hull, and (optionally) pre-simplify it
-    with PCHS to `simplify_to` vertices. Returns the point set every search
-    trial's halfspaces must contain."""
+def _load_hull(mesh_path):
+    """Read a mesh and return its full (non-simplified) convex hull (hV, hF)."""
     import igl
     import igl.copyleft.cgal
 
     V, F = igl.read_triangle_mesh(mesh_path)
     hF = igl.copyleft.cgal.convex_hull(V)
     hV, hF, _, _ = igl.remove_unreferenced(V, hF)
+    return hV, hF
 
+
+def _load_points(hV, hF, simplify_to):
+    """(Optionally) pre-simplify a hull with PCHS to `simplify_to`
+    vertices. Returns the point set every search trial's halfspaces must
+    contain."""
     if simplify_to is None or simplify_to >= hV.shape[0]:
         return hV
 
@@ -25,6 +29,15 @@ def _load_points(mesh_path, simplify_to):
 
     pV, pPI, pPC = pchs.simplify_convex_hull(hV, hF, simplify_to)
     return pV
+
+
+def _load_candidates(hV, hF, weight_by):
+    from mcpolytope.weights import WEIGHT_FUNCS, hull_face_candidates
+
+    normals, areas = hull_face_candidates(hV, hF)
+    weight_fn = WEIGHT_FUNCS[weight_by]
+    weights = weight_fn(hV, hF, normals, areas)
+    return normals, weights
 
 
 def main(argv=None):
@@ -50,15 +63,37 @@ def main(argv=None):
     parser.add_argument(
         "--trace-every-batches", type=int, default=None, help="record a trace checkpoint every this many batches"
     )
+    parser.add_argument(
+        "--candidates",
+        choices=["random", "original-hull"],
+        default="random",
+        help="sample directions uniformly over the sphere (default), or from the mesh's original "
+        "(pre-simplification) convex hull face normals",
+    )
+    parser.add_argument(
+        "--weight-by",
+        choices=["uniform", "area", "inverse_area", "solid_angle", "dihedral"],
+        default="uniform",
+        help="candidate weighting scheme (only meaningful with --candidates original-hull)",
+    )
+    parser.add_argument(
+        "--avoid-duplicates", action="store_true", help="avoid resampling the same candidate direction within a trial"
+    )
     args = parser.parse_args(argv)
 
     wp.init()
 
     from mcpolytope.search import Search
 
+    hV, hF = _load_hull(args.mesh)
     simplify_to = args.simplify_to if args.simplify_to > 0 else None
-    points = _load_points(args.mesh, simplify_to)
+    points = _load_points(hV, hF, simplify_to)
     print(f"loaded {points.shape[0]} points from {args.mesh}", file=sys.stderr)
+
+    candidates = weights = None
+    if args.candidates == "original-hull":
+        candidates, weights = _load_candidates(hV, hF, args.weight_by)
+        print(f"using {candidates.shape[0]} original-hull candidate directions, weight_by={args.weight_by}", file=sys.stderr)
 
     search = Search(
         points,
@@ -67,6 +102,9 @@ def main(argv=None):
         big_factor=args.big_factor,
         batch_size=args.batch_size,
         device=args.device,
+        candidates=candidates,
+        weights=weights,
+        avoid_duplicates=args.avoid_duplicates,
     )
 
     trace_every = args.trace_every_batches

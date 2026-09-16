@@ -93,17 +93,54 @@ verified to produce bit-identical results to the ungraphed path. On the L40 at
 `batch_size >= 1<<20` we're already compute-bound (<1% difference either way) — the
 option is there for smaller-batch / launch-overhead-bound scenarios.
 
+### Sampling from a weighted candidate direction set
+
+Sampling directions i.i.d. from the continuous sphere turns out to converge far too
+slowly to compete with PCHS's greedy simplification (see the first row of
+[Results](#results)). `Search(..., candidates=(K,3), weights=(K,)|None,
+avoid_duplicates=False)` instead draws each trial's `n` directions from a **finite
+pool** — e.g. the face normals of the mesh's *original* (non-simplified) convex hull —
+optionally weighted (`mcpolytope/weights.py`: `area`, `inverse_area`, a cheap
+`solid_angle` proxy, `dihedral`/sharp-edge score). This concentrates the search on
+directions that are geometrically plausible real facets instead of wasting trials on
+directions nothing in the mesh actually points toward.
+
+- **Sampling is O(1) per draw** via [Walker's alias method](https://en.wikipedia.org/wiki/Alias_method)
+  (`mcpolytope/candidates.py`), independent of pool size `K` — matters since this runs
+  `n` times per trial across billions of trials. (Caught a real bug here: a `wp.uint32`
+  RNG state passed into a `wp.func` is *not* mutated-in-place across the call boundary —
+  only sequential builtin calls within one function body are — so failing to
+  reassign `state` from `sample_alias`'s return made every draw in a trial identical.
+  See git history / `test_successive_draws_within_one_thread_are_not_all_identical`.)
+- **With replacement by default** (cheap); `avoid_duplicates=True` opts into a
+  bounded-retry rejection scheme (falls back to a deterministic linear scan for the
+  first unused candidate on repeated collision — never an infinite loop, requires
+  `n <= K`) rather than a true weighted-reservoir sampler, since collisions are rare
+  when `K >> n` and a full weighted-without-replacement sampler would cost `O(K)` per
+  trial for no measured benefit at that regime.
+- This also exposed a second, more fundamental bug in `polytope_volume_from_halfspaces`
+  itself: the degenerate-constraint branch had no numerical tolerance, so float32
+  rounding noise in `dot(d,d)` for (near-)duplicate directions could push a
+  mathematically-redundant constraint's `rhs` a hair negative, wrongly zeroing out an
+  entire facet (observed as an 8-identical-directions trial silently reporting volume
+  `0.0` instead of the correct `+inf`). This was a latent gap continuous Gaussian
+  sampling could never trigger (near-zero probability of exact/near-duplicate
+  directions there) — only surfaced once a finite candidate pool made duplicates common.
+
 ## Layout
 
 ```
 mcpolytope/
-  support.py   # wp.func: support offsets b_i = max_j dot(dir_i, points_j)
-  volume.py    # wp.func: polytope_volume_from_halfspaces (facet-clipping algorithm)
-  search.py    # Search: batched trial + on-device reduction + optional CUDA graph
-  cli.py       # `mcpolytope mesh.ply -n 20 --trials 1e9 ...`
-tests/         # accuracy (vs pchs reference), robustness, GPU/CPU parity, perf smoke
+  support.py     # wp.func: support offsets b_i = max_j dot(dir_i, points_j)
+  volume.py      # wp.func: polytope_volume_from_halfspaces (facet-clipping algorithm)
+  candidates.py  # O(1) weighted categorical sampling (Walker's alias method)
+  weights.py     # mesh -> candidate directions + weight schemes (area, dihedral, ...)
+  search.py      # Search: batched trial + on-device reduction + optional CUDA graph
+  cli.py         # `mcpolytope mesh.ply -n 20 --trials 1e9 ...`
+tests/           # accuracy (vs pchs reference), robustness, GPU/CPU parity, perf smoke
 examples/
-  actaeon_search.py  # compares this search against PCHS's greedy simplification
+  actaeon_search.py    # compares random-sphere search against PCHS's greedy simplification
+  weight_experiment.py # compares all candidate weighting schemes (+ avoid_duplicates) against PCHS
 ```
 
 ## Usage
@@ -113,10 +150,18 @@ pip install -e ".[test]"
 mcpolytope path/to/mesh.ply -n 20 --trials 1e9 --use-graph --trace-csv trace.csv
 ```
 
+restricting to the mesh's original hull face normals, area-weighted, without
+duplicates within a trial (see [Results](#results) for why this combination matters):
+
+```
+mcpolytope path/to/mesh.ply -n 20 --trials 1e8 --candidates original-hull --weight-by area --avoid-duplicates
+```
+
 or, to compare directly against PCHS's greedy simplification for the same `n`:
 
 ```
 python examples/actaeon_search.py path/to/mesh.ply -n 8 --trials 5e8
+python examples/weight_experiment.py path/to/mesh.ply -n 20 --trials 1e8
 ```
 
 ## Running tests
@@ -139,14 +184,56 @@ PCHS's own greedy simplification competes over):
 (\* PCHS greedy volume for n=20 taken from a separate simplification run, not
 re-measured in this table's session.)
 
-**Takeaway:** unstructured random-direction search, even at billions of trials, does
-not beat PCHS's greedy dual-edge-collapse simplification for either face count tested.
-The search's own trace (`--trace-csv`) shows fast early improvement that decays
-logarithmically — consistent with a `3n`-dimensional continuous optimization landscape
-where good direction sets occupy a small volume fraction that unstructured Monte Carlo
-struggles to concentrate on, while greedy edge collapse exploits local mesh structure
-directly. This is a real (if somewhat expected) negative result for "does brute force
-random search compete with a good heuristic here" — smaller `n` and/or smarter sampling
-(e.g. importance sampling around greedy solutions, simulated annealing / local search
-instead of i.i.d. resampling) are the natural next things to try if closing this gap
-mattered.
+**Takeaway (random-sphere sampling):** unstructured random-direction search over the
+*continuous* sphere, even at billions of trials, does not beat PCHS's greedy
+dual-edge-collapse simplification for either face count tested. The search's own trace
+(`--trace-csv`) shows fast early improvement that decays logarithmically — consistent
+with a `3n`-dimensional continuous optimization landscape where good direction sets
+occupy a small volume fraction that unstructured Monte Carlo struggles to concentrate
+on, while greedy edge collapse exploits local mesh structure directly.
+
+### Candidate-direction weighting comparison
+
+That negative result motivated restricting the search to a **finite candidate pool**
+(the mesh's original, pre-simplification hull face normals) instead of the continuous
+sphere (`examples/weight_experiment.py`, same `Actaeon.ply` setup as above, `n=20`,
+1e8 trials/scheme on the L40; PCHS greedy for `n=20` is `0.71448`):
+
+| scheme (weight_by) | avoid_duplicates | volume  | / PCHS |
+|---------------------|:---:|---------|--------|
+| (random sphere, for reference) | n/a | 0.90454 | 1.266x |
+| uniform              | either | 0.80509 | 1.127x |
+| dihedral             | either | 0.80922 | 1.133x |
+| inverse_area         | either | 0.93260 | 1.305x |
+| solid_angle          | False | 0.74550 | 1.043x |
+| **solid_angle**      | **True** | **0.71777** | **1.005x** |
+| area                 | False | 0.72035 | 1.008x |
+| **area**             | **True** | **0.71564** | **1.002x** |
+
+And at `n=8` (1e7 trials/scheme; PCHS greedy is `0.84954`), **area-weighted candidate
+search with `avoid_duplicates=True` actually beats PCHS greedy**, `0.83249` vs
+`0.84954` — 2% smaller:
+
+| scheme (weight_by) | avoid_duplicates | volume  | / PCHS |
+|---------------------|:---:|---------|--------|
+| (random sphere, for reference) | n/a | 1.20511 | 1.419x |
+| **area**            | **either** | **0.83249** | **0.980x** |
+| solid_angle          | True | 0.83611 | 0.984x |
+| uniform / dihedral   | either | ~1.04 | ~1.22x |
+| inverse_area         | either | ~1.26 | ~1.49x |
+
+**Takeaway (candidate sampling):** restricting to real hull-face directions, weighted
+by **area**, closes almost the entire gap to (and at `n=8`, beats) PCHS's greedy
+simplification — a striking difference from unstructured continuous sampling, at a
+tiny fraction of the trial budget (1e7-1e8 vs 5e8-2e9). `inverse_area` performs worst,
+consistent with small/sliver faces rarely being useful supporting directions for a
+tight enclosure. `avoid_duplicates=True` only matters (and only barely) for `area` and
+`solid_angle` — the two most concentrated/skewed weightings, where without-replacement
+sampling meaningfully reduces wasted duplicate-direction trials; for flatter
+distributions (`uniform`, `dihedral`, `inverse_area`) collisions are already rare
+enough at `K` in the thousands that it made no measurable difference, matching the "only
+implement if it measurably helps" premise this feature started from — so it's an
+available option, not the default. Smaller `n` and/or smarter sampling (e.g. importance
+sampling seeded from a greedy solution, simulated annealing / local search instead of
+i.i.d. resampling) remain the natural next things to try if closing the remaining gap
+at larger `n` mattered.
