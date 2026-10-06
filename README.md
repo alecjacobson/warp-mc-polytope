@@ -72,6 +72,20 @@ Validated against [`pchs`](https://github.com/alecjacobson/progressive-convex-hu
 CGAL/qhull-backed dual-hull construction across `n in {4,6,8,12,20,32}`: max relative
 error ~1e-6 on bounded random polytopes (see `tests/test_volume.py`).
 
+**Duplicate halfspaces (fixed).** If two input directions are identical (same `d`, hence
+same `b`) the planes coincide, so each one's clipping against the other is a no-op
+(parallel, `rhs ~ 0`). Originally both kept the same full facet polygon and that facet's
+pyramid was added once per copy (a cube with one repeated face reported `9.33` instead of
+`8`). Now the lowest-index coincident plane owns the facet, with regression tests
+(`tests/test_volume.py`) and no measurable throughput change. This only arises with
+candidate sampling *with replacement*, and it is common there: on Actaeon's 3750 hull
+triangles the chance a trial draws the same candidate index twice
+(`1 - exp(-C(n,2) * sum(p_i^2))`) is `uniform` 0.7% (n=8) / 4.9% (n=20), `area`
+67% / 99.9%, `solid_angle` 93% / ~100%. Results in the sections below were re-measured
+after the fix. A with-replacement winner can legitimately contain a repeated direction
+(it is then effectively an `n-1`-face polytope), and its reported volume now matches an
+independent `scipy` halfspace-intersection volume to ~3e-6.
+
 ### Search driver: no host sync, deterministic replay, optional CUDA graph
 
 `mcpolytope/search.py`'s `Search` class runs trials in batches (default `1<<20`
@@ -196,9 +210,18 @@ pytest
 
 ## Results
 
-Measured on an NVIDIA L40, mesh `Actaeon.ply` (66k faces) reduced to a 996-point convex
-hull, then PCHS-pre-simplified to 500 points before searching (matching the point set
-PCHS's own greedy simplification competes over):
+Measured on an NVIDIA L40, mesh `Actaeon.ply`. Its convex hull has 1877 vertices / 3750
+triangles; for searching, the hull is first PCHS-simplified to 500 faces (996 vertices,
+note that PCHS's target counts faces, not points), matching the point set PCHS's own greedy
+simplification competes over.
+
+**How much to trust small differences.** The reported best is a minimum over 1e8 trials,
+an extreme-value statistic. With identical settings and seed, separate processes gave
+`uniform`, `n=20` bests of `0.775`, `0.811` and `0.815`, whereas `area`/`solid_angle` varied
+by under 1%. `Search` itself is deterministic within a process (identical results on
+repeated runs), and I ruled out PCHS mutating its inputs/outputs and hull face order as
+causes, but I did **not** identify what perturbs trial sampling across processes. Treat
+single-run gaps of a few percent as noise; only the larger gaps below are meaningful.
 
 | n  | trials      | time   | trials/sec | MC search volume | PCHS greedy volume | MC / PCHS |
 |----|-------------|--------|------------|-------------------|---------------------|-----------|
@@ -221,46 +244,46 @@ on, while greedy edge collapse exploits local mesh structure directly.
 That negative result motivated restricting the search to a **finite candidate pool**
 (the mesh's original, pre-simplification hull face normals) instead of the continuous
 sphere (`examples/weight_experiment.py`, same `Actaeon.ply` setup as above, `n=20`,
-1e8 trials/scheme on the L40; PCHS greedy for `n=20` is `0.71448`):
+1e8 trials/scheme on the L40, measured after the duplicate fix; PCHS greedy for `n=20`
+is `0.71448`):
 
 | scheme (weight_by) | avoid_duplicates | volume  | / PCHS |
 |---------------------|:---:|---------|--------|
 | (random sphere, for reference) | n/a | 0.90454 | 1.266x |
-| uniform              | either | 0.80509 | 1.127x |
-| dihedral             | either | 0.80922 | 1.133x |
-| inverse_area         | either | 0.93260 | 1.305x |
-| solid_angle          | False | 0.74550 | 1.043x |
-| **solid_angle**      | **True** | **0.71777** | **1.005x** |
-| area                 | False | 0.72035 | 1.008x |
-| **area**             | **True** | **0.71564** | **1.002x** |
+| uniform (see noise note above) | either | 0.77529 | 1.085x |
+| dihedral             | either | 0.81498 | 1.141x |
+| inverse_area         | either | 0.93286 | 1.306x |
+| solid_angle          | False | 0.72884 | 1.020x |
+| **solid_angle**      | **True** | **0.71738** | **1.004x** |
+| area                 | False | 0.71941 | 1.007x |
+| **area**             | **True** | **0.71513** | **1.001x** |
 
-And at `n=8` (1e7 trials/scheme; PCHS greedy is `0.84954`), **area-weighted candidate
-search with `avoid_duplicates=True` actually beats PCHS greedy**, `0.83249` vs
-`0.84954` — 2% smaller:
+And at `n=8` (5e7 trials/scheme; PCHS greedy is `0.84954`), **area-weighted candidate
+search actually beats PCHS greedy**, `0.83249` vs `0.84954`, 2% smaller:
 
 | scheme (weight_by) | avoid_duplicates | volume  | / PCHS |
 |---------------------|:---:|---------|--------|
-| (random sphere, for reference) | n/a | 1.20511 | 1.419x |
+| (random sphere, for reference) | n/a | 1.14187 | 1.344x |
 | **area**            | **either** | **0.83249** | **0.980x** |
-| solid_angle          | True | 0.83611 | 0.984x |
-| uniform / dihedral   | either | ~1.04 | ~1.22x |
-| inverse_area         | either | ~1.26 | ~1.49x |
+| solid_angle          | either | 0.84114 | 0.990x |
+| uniform              | either | 1.00403 | 1.182x |
+| dihedral             | either | 1.01585 | 1.196x |
+| inverse_area         | either | 1.14451 | 1.347x |
 
 **Takeaway (candidate sampling):** restricting to real hull-face directions, weighted
-by **area**, closes almost the entire gap to (and at `n=8`, beats) PCHS's greedy
-simplification — a striking difference from unstructured continuous sampling, at a
-tiny fraction of the trial budget (1e7-1e8 vs 5e8-2e9). `inverse_area` performs worst,
-consistent with small/sliver faces rarely being useful supporting directions for a
-tight enclosure. `avoid_duplicates=True` only matters (and only barely) for `area` and
-`solid_angle` — the two most concentrated/skewed weightings, where without-replacement
-sampling meaningfully reduces wasted duplicate-direction trials; for flatter
-distributions (`uniform`, `dihedral`, `inverse_area`) collisions are already rare
-enough at `K` in the thousands that it made no measurable difference, matching the "only
-implement if it measurably helps" premise this feature started from — so it's an
-available option, not the default. Smaller `n` and/or smarter sampling (e.g. importance
-sampling seeded from a greedy solution, simulated annealing / local search instead of
-i.i.d. resampling) remain the natural next things to try if closing the remaining gap
-at larger `n` mattered.
+by **area** (or `solid_angle`), closes almost the entire gap to PCHS's greedy
+simplification at `n=20` and beats it at `n=8`, a striking difference from unstructured
+continuous sampling, at a small fraction of the trial budget (5e7-1e8 vs 5e8-2e9).
+`inverse_area` performs worst, consistent with small/sliver faces rarely being useful
+supporting directions for a tight enclosure; `uniform` and `dihedral` sit in between.
+`avoid_duplicates=True` helps modestly at `n=20` for the two concentrated weightings
+(`area` 0.7194 -> 0.7151, `solid_angle` 0.7288 -> 0.7174; before the duplicate fix the
+`solid_angle` gap looked larger, 0.746 -> 0.718, so part of it was the bug) because a
+repeated draw wastes a face. At `n=8` it makes no difference to the winner, and for the
+flatter weightings repeats are rare. So it is an option, not the default. Smaller `n`
+and/or smarter sampling (e.g. importance sampling seeded from a greedy solution,
+simulated annealing / local search instead of i.i.d. resampling) remain the natural next
+things to try if closing the remaining gap at larger `n` mattered.
 
 ### Continuous importance sampling (kappa) vs. subset selection
 
@@ -269,28 +292,35 @@ continuous vMF jitter around the weighted candidates instead of exact reuse — 
 discrete subset selection? Swept `kappa` for the `area` and `solid_angle` schemes at
 both `n=20` (1e8 trials/kappa) and `n=8` (5e7 trials/kappa):
 
-`n=20`, `area` scheme (discrete exact, `avoid_duplicates=True`: `0.71499`, `1.0007x`):
+All measured after the duplicate fix. `kappa` mode has no duplicate avoidance (repeated
+seeds give two near-identical directions), so the like-for-like discrete comparator is
+discrete *with replacement*; the deduplicated result is shown too.
+
+`n=20`, `area` scheme (1e8 trials each; discrete with replacement `0.71941` / `1.007x`,
+deduplicated `0.71513` / `1.001x`):
 
 | kappa | volume  | / PCHS |
 |------:|---------|--------|
-| 50    | 0.82421 | 1.154x |
-| 200   | 0.78873 | 1.104x |
-| 1000  | 0.75994 | 1.064x |
-| 5000  | 0.74325 | 1.040x |
+| 200   | 0.78086 | 1.093x |
+| 1000  | 0.76018 | 1.064x |
+| 5000  | 0.74394 | 1.041x |
 
-`n=8`, `area` scheme (discrete exact, `avoid_duplicates=True`: `0.83249`, `0.980x`):
+`n=8`, `area` scheme (5e7 trials each; discrete `0.83249` / `0.980x`, with or without
+replacement):
 
 | kappa | volume  | / PCHS |
 |------:|---------|--------|
-| 0     | 1.02801 | 1.210x |
-| 50    | 0.98561 | 1.160x |
-| 200   | 0.91079 | 1.072x |
-| 1000  | 0.88656 | 1.044x |
-| 5000  | 0.86223 | 1.015x |
+| 200   | 0.92280 | 1.086x |
+| 1000  | 0.87393 | 1.029x |
+| 5000  | 0.85150 | 1.002x |
+
+(`solid_angle` at `n=8`: 0.97327 / 0.93082 / 0.89632 for kappa 200 / 1000 / 5000, versus
+discrete 0.84114.)
 
 **Takeaway (continuous importance sampling): no — at every kappa tried, at matched
 trial budgets, continuous vMF jitter around the weighted candidates converges *toward*
-the discrete result but never reaches or beats it**, at either `n`. The trend is
+the discrete result but never reaches or beats it**, at either `n`, including against
+the like-for-like with-replacement baseline. The trend is
 monotonic and smooth in `kappa` (validating the sampler: `kappa->inf` really does
 recover the discrete answer, as designed), it just never crosses over even at `kappa`
 high enough that samples are typically within ~1 degree of their seed face. The likely
