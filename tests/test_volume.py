@@ -54,6 +54,29 @@ def test_duplicates_in_random_polytope_match_deduplicated_volume():
         checked += 1
 
 
+def _prism(sides, r=1.0, h=1.0):
+    ang = 2 * np.pi * np.arange(sides) / sides
+    side = np.stack([np.cos(ang), np.sin(ang), np.zeros(sides)], axis=1)
+    dirs = np.vstack([side, [[0, 0, 1], [0, 0, -1]]])
+    b = np.concatenate([np.full(sides, r), [h, h]])
+    exact = sides * r * r * np.tan(np.pi / sides) * (2 * h)
+    return dirs, b, exact
+
+
+def test_facet_within_polygon_capacity_is_exact():
+    # 12-gon prism: the caps are 12-gons, within POLY_MAX
+    dirs, b, exact = _prism(12)
+    assert volume_of(dirs, b, big=16.0) == pytest.approx(exact, rel=1e-4)
+
+
+def test_facet_beyond_polygon_capacity_is_invalid_not_wrong():
+    # 24-gon prism: each cap is a 24-gon, more than POLY_MAX (16) vertices.
+    # The documented behaviour is +inf (trial discarded); it must never be a
+    # silently truncated, finite, wrong volume.
+    dirs, b, _ = _prism(24)
+    assert not np.isfinite(volume_of(dirs, b, big=16.0))
+
+
 def test_octahedron():
     dirs = []
     for sx in (1, -1):

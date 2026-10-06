@@ -5,11 +5,16 @@ import warp as wp
 # (no dynamic/heap allocation inside kernels).
 N_MAX = 32
 
-# A facet-local 2D clip polygon can gain at most one vertex per half-plane
-# clip (Sutherland-Hodgman clipping a convex polygon by one half-plane).
-# Starting from a 4-gon and clipping against up to N_MAX-1 other
-# constraints, the vertex count is bounded by N_MAX + 3.
-POLY_MAX = N_MAX + 4
+# Capacity of the per-facet 2D clip polygon. A clip can add a vertex per
+# half-plane, so the worst case would be N_MAX + 3, but real facets (and the
+# intermediate polygons while clipping) have far fewer vertices. The polygon
+# buffers dominate per-thread local memory, so capacity directly sets
+# occupancy: 16 instead of N_MAX + 4 roughly halves the volume kernel's
+# runtime. A clip that would exceed the capacity marks the whole trial
+# invalid (volume = +inf) rather than truncating, so a trial can only ever be
+# discarded, never mis-measured. Consequence: a polytope with a facet of more
+# than ~POLY_MAX edges reports +inf.
+POLY_MAX = 16
 
 fvecN = wp.types.vector(length=N_MAX, dtype=wp.float32)
 polyvec = wp.types.vector(length=POLY_MAX, dtype=wp.float32)
@@ -25,6 +30,7 @@ def _clip_halfplane(px: polyvec, py: polyvec, count: int, a_u: float, a_v: float
     new_px = polyvec()
     new_py = polyvec()
     new_count = int(0)
+    overflow = bool(False)
     for k in range(count):
         k2 = k + 1
         if k2 == count:
@@ -42,6 +48,8 @@ def _clip_halfplane(px: polyvec, py: polyvec, count: int, a_u: float, a_v: float
                 new_px[new_count] = x1
                 new_py[new_count] = y1
                 new_count += 1
+            else:
+                overflow = True
         if in1 != in2:
             t = d1 / (d1 - d2)
             xi = x1 + t * (x2 - x1)
@@ -50,7 +58,9 @@ def _clip_halfplane(px: polyvec, py: polyvec, count: int, a_u: float, a_v: float
                 new_px[new_count] = xi
                 new_py[new_count] = yi
                 new_count += 1
-    return new_px, new_py, new_count
+            else:
+                overflow = True
+    return new_px, new_py, new_count, overflow
 
 
 @wp.func
@@ -121,6 +131,7 @@ def polytope_volume_from_halfspaces(dx: fvecN, dy: fvecN, dz: fvecN, b: fvecN, n
             count = int(4)
 
             bi = b[i]
+            overflow = bool(False)
             for j in range(n):
                 if j != i and count > 0:
                     njx = dx[j]
@@ -152,7 +163,13 @@ def polytope_volume_from_halfspaces(dx: fvecN, dy: fvecN, dz: fvecN, b: fvecN, n
                             # lowest index owns the facet.
                             count = 0
                     else:
-                        px, py, count = _clip_halfplane(px, py, count, a_u, a_v, rhs)
+                        px, py, count, clip_overflow = _clip_halfplane(px, py, count, a_u, a_v, rhs)
+                        if clip_overflow:
+                            overflow = True
+                            count = 0
+
+            if overflow:
+                invalid = True
 
             if count >= 3:
                 touches = bool(False)

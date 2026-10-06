@@ -86,6 +86,20 @@ after the fix. A with-replacement winner can legitimately contain a repeated dir
 (it is then effectively an `n-1`-face polytope), and its reported volume now matches an
 independent `scipy` halfspace-intersection volume to ~3e-6.
 
+**Facet capacity and why it matters for speed.** The volume kernel is bound by per-thread
+local memory, not arithmetic: with the original polygon capacity (`N_MAX + 4 = 36`
+vertices) the trial kernel used 196 registers and 2176 bytes of local memory per thread,
+so only about 8 warps fit per SM. Setting `POLY_MAX = 16` (1408 bytes, 152 registers) is
+about 1.85x faster with no algorithm change (n=8: 47M -> 87M trials/s, n=20: 9M -> 16.4M,
+all four sampling modes). A clip that would exceed the capacity marks the trial invalid
+(`+inf`) instead of truncating, so a trial can only be discarded, never mis-measured:
+across 6M test trials (random directions and Actaeon's clustered, area-weighted hull
+normals, n = 8/20/32) **no volume changed**, and trials lost to overflow were 0 for random
+directions, 0.0001% for Actaeon at n=20 and 0.29% for Actaeon at n=32. Consequence: a
+polytope with a facet of more than ~16 edges reports `+inf`
+(`tests/test_volume.py::test_facet_beyond_polygon_capacity_is_invalid_not_wrong`).
+Raising the cap costs speed steadily (n=20: 17.2M at 16, 14.4M at 20, 12.4M at 24).
+
 ### Search driver: no host sync, deterministic replay, optional CUDA graph
 
 `mcpolytope/search.py`'s `Search` class runs trials in batches (default `1<<20`
@@ -209,6 +223,9 @@ pytest
 ```
 
 ## Results
+
+*Throughput figures in the tables below were measured before the facet-capacity change above
+and are roughly 1.8x lower than current.*
 
 Measured on an NVIDIA L40, mesh `Actaeon.ply`. Its convex hull has 1877 vertices / 3750
 triangles; for searching, the hull is first PCHS-simplified to 500 faces (996 vertices,
