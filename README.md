@@ -100,6 +100,14 @@ polytope with a facet of more than ~16 edges reports `+inf`
 (`tests/test_volume.py::test_facet_beyond_polygon_capacity_is_invalid_not_wrong`).
 Raising the cap costs speed steadily (n=20: 17.2M at 16, 14.4M at 20, 12.4M at 24).
 
+**Tried and rejected: lane-per-facet tile kernel.** Since `n <= 32` fits one warp, a
+32-thread Warp tile per trial with lane `i` clipping facet `i` (constraints read from a
+shared tile, `tile_sum`/`tile_max` to reduce) cuts per-thread state to 106 registers /
+384 bytes local, yet it is *slower* than thread-per-trial at every `n`: 0.55x (n=8), 0.63x
+(n=20), 0.80x (n=32). Only `n` of 32 lanes work and lanes wait on the slowest facet; a
+single `vec4` shared read per constraint gave identical throughput, so extract overhead is
+not the cause. Prototype and numbers are in `experiments/tile_lane_per_facet.py`.
+
 ### Search driver: no host sync, deterministic replay, optional CUDA graph
 
 `mcpolytope/search.py`'s `Search` class runs trials in batches (default `1<<20`
