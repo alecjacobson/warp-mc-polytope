@@ -144,6 +144,13 @@ def polytope_volume_from_halfspaces(dx: fvecN, dy: fvecN, dz: fvecN, b: fvecN, n
                         # effectively-unbounded configuration).
                         if rhs < -deg_tol:
                             count = 0
+                        elif dotij > 0.0 and rhs <= deg_tol and j < i:
+                            # Coincident same-orientation plane (exact
+                            # duplicate direction): both facets would
+                            # otherwise keep identical polygons and the
+                            # pyramid would be counted once per copy. The
+                            # lowest index owns the facet.
+                            count = 0
                     else:
                         px, py, count = _clip_halfplane(px, py, count, a_u, a_v, rhs)
 

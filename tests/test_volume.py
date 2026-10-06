@@ -14,6 +14,46 @@ def test_cube():
     assert v == pytest.approx(8.0, rel=1e-5)
 
 
+@pytest.mark.parametrize("extra", [[0], [0, 1], [0, 0, 0], [5, 2, 0, 3]])
+def test_duplicate_halfspaces_are_not_double_counted(extra):
+    # Regression: exact duplicate planes used to each keep a full facet
+    # polygon, so the pyramid was counted once per copy (cube + one repeated
+    # face gave 9.33 instead of 8).
+    dirs = np.vstack([CUBE_DIRS, CUBE_DIRS[extra]])
+    v = volume_of(dirs, np.ones(len(dirs)), big=8.0)
+    assert v == pytest.approx(8.0, rel=1e-5)
+
+
+def test_duplicate_halfspaces_shuffled_order():
+    rng = np.random.default_rng(0)
+    dirs = np.vstack([CUBE_DIRS, CUBE_DIRS[[0, 3]]])
+    for _ in range(10):
+        perm = rng.permutation(len(dirs))
+        v = volume_of(dirs[perm], np.ones(len(dirs)), big=8.0)
+        assert v == pytest.approx(8.0, rel=1e-5)
+
+
+def test_duplicates_in_random_polytope_match_deduplicated_volume():
+    # A random bounded polytope with some planes repeated (and the order
+    # shuffled) must have exactly the volume of the deduplicated one.
+    rng = np.random.default_rng(1)
+    checked = 0
+    while checked < 20:
+        d = rng.standard_normal((10, 3))
+        d /= np.linalg.norm(d, axis=1, keepdims=True)
+        pts = rng.standard_normal((200, 3))
+        pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+        b = np.max(d @ pts.T, axis=1)
+        v0 = volume_of(d, b, big=60.0)
+        if not np.isfinite(v0):
+            continue
+        idx = np.concatenate([np.arange(10), rng.integers(0, 10, size=6)])
+        idx = rng.permutation(idx)
+        v1 = volume_of(d[idx], b[idx], big=60.0)
+        assert v1 == pytest.approx(v0, rel=1e-4)
+        checked += 1
+
+
 def test_octahedron():
     dirs = []
     for sx in (1, -1):
